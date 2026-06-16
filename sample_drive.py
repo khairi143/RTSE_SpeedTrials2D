@@ -198,6 +198,110 @@ def read_front_camera_task():
 def read_back_camera_task():
     read_single_camera(back_camera_sock, "Back Camera", 'latest_back_frame')
 
+# =========================================================
+# [SHAHIR - Token Detection]
+# HSV color ranges calibrated for SpeedTrials2D tokens.
+# Green  : H=40-75  (lime green)
+# Red    : H=0-15 and H=165-180 (wraps around HSV wheel)
+# Yellow : H=16-35  (orange-yellow)
+# =========================================================
+GREEN_LOWER  = np.array([40,  40, 100])
+GREEN_UPPER  = np.array([75, 255, 255])
+
+RED_LOWER1   = np.array([0,  100, 100])
+RED_UPPER1   = np.array([15, 255, 255])
+RED_LOWER2   = np.array([165, 100, 100])
+RED_UPPER2   = np.array([180, 255, 255])
+
+YELLOW_LOWER = np.array([16, 100, 150])
+YELLOW_UPPER = np.array([35, 255, 255])
+
+
+def detect_tokens(frame):
+    """
+    [PERSON 1 - Token Detection]
+    Scans the front camera frame for colored tokens using HSV color detection.
+    Only looks at the bottom 3/4 of the frame (top 1/4 is sky, no tokens there).
+
+    Returns:
+        tokens (dict): {'green': x_pos or None, 'red': x_pos or None, 'yellow': x_pos or None}
+                        x_pos is the center-x pixel of the largest detected blob.
+        frame_width (int): width of the frame in pixels.
+    """
+    h, w = frame.shape[:2]
+    roi = frame[h // 4 : h * 7 // 10, :]  # ignore sky (top 25%) and own car + near ground (bottom 30%)
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+
+    def largest_blob_x(mask):
+        """Find the center-x of the largest token-shaped blob in the mask."""
+        mask = cv2.dilate(mask, None, iterations=2)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None
+
+        token_candidates = []
+        for c in contours:
+            area = cv2.contourArea(c)
+            if not (150 < area < 1000):
+                continue                        # wrong size
+            x, y, cw, ch = cv2.boundingRect(c)
+            if ch == 0:
+                continue
+            aspect = cw / ch
+            if not (0.4 < aspect < 2.5):
+                continue                        # too elongated (road stripe)
+            fill = area / (cw * ch)
+            if fill < 0.45:
+                continue                        # hollow/diagonal shape (road stripe)
+            cx = x + cw // 2
+            if cx < w * 0.25 or cx > w * 0.75:
+                continue                        # too close to screen edge
+            token_candidates.append((area, cx))
+
+        if not token_candidates:
+            return None
+        # Return x of the largest passing candidate
+        return max(token_candidates, key=lambda t: t[0])[1]
+
+    # Detect each token color
+    green_x  = largest_blob_x(cv2.inRange(hsv, GREEN_LOWER, GREEN_UPPER))
+
+    red_mask = cv2.bitwise_or(                              # red wraps around HSV
+        cv2.inRange(hsv, RED_LOWER1, RED_UPPER1),
+        cv2.inRange(hsv, RED_LOWER2, RED_UPPER2)
+    )
+    red_x    = largest_blob_x(red_mask)
+
+    yellow_x = largest_blob_x(cv2.inRange(hsv, YELLOW_LOWER, YELLOW_UPPER))
+
+    # Draw detected blobs on the frame for visual debug
+    roi_top = h // 4
+    debug_frame = frame.copy()
+    for color_name, mask, bgr in [
+        ('G', cv2.inRange(hsv, GREEN_LOWER, GREEN_UPPER), (0, 255, 0)),
+        ('R', red_mask, (0, 0, 255)),
+        ('Y', cv2.inRange(hsv, YELLOW_LOWER, YELLOW_UPPER), (0, 255, 255)),
+    ]:
+        mask = cv2.dilate(mask, None, iterations=2)
+        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for c in cnts:
+            area = cv2.contourArea(c)
+            if not (150 < area < 1000):
+                continue
+            x, y, cw, ch = cv2.boundingRect(c)
+            if ch == 0: continue
+            aspect = cw / ch
+            fill = area / (cw * ch)
+            cx = x + cw // 2
+            if 0.4 < aspect < 2.5 and fill > 0.45 and w * 0.25 < cx < w * 0.75:
+                cv2.rectangle(debug_frame, (x, y + roi_top), (x + cw, y + ch + roi_top), bgr, 2)
+                cv2.putText(debug_frame, f'{color_name}:{area:.0f}',
+                            (x, y + roi_top - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, bgr, 1)
+    cv2.imshow('Token Debug', cv2.resize(debug_frame, (640, 480)))
+    cv2.waitKey(1)
+
+    return {'green': green_x, 'red': red_x, 'yellow': yellow_x}, w
+
 def processing_task():
     #This is where you write your image processing code to decide how to control the car
     #You can use libraries like OpenCV to process the image
