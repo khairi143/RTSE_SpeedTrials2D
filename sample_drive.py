@@ -27,6 +27,15 @@ shared_data = {
 data_lock = threading.Lock()
 is_running = True
 
+shared_data = {
+    'latest_front_frame': None,
+    'latest_back_frame': None,
+    'steering_input': 0.0,
+    'acceleration_input': 0.0,
+    'decision': 'none',     # NEW — 'left', 'right', or 'none'
+}
+
+
 # ---------------------------------------------------------
 # Real-Time Scheduling Framework (Do not change this in your code)
 # ---------------------------------------------------------
