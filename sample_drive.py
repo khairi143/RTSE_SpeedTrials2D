@@ -302,17 +302,91 @@ def detect_tokens(frame):
 
     return {'green': green_x, 'red': red_x, 'yellow': yellow_x}, w
 
+# =========================================================
+# [PERSON 2 - Token Decision]
+# Takes token positions and decides steering direction.
+# Priority order: Green (collect) > Red (avoid) > Yellow (dodge)
+# Frame is divided into 3 zones: left / center / right
+# =========================================================
+def decide_steering(tokens, frame_width):
+    """
+    [PERSON 2 - Token Decision]
+    Decides which direction to steer based on detected token positions.
+
+    Logic:
+        - Green token detected → steer toward it to collect (+10% speed)
+        - Red token detected   → steer away from it to avoid (-20% speed)
+        - Yellow token detected → dodge it (random chaos effect)
+        - No token detected    → go straight
+
+    Returns:
+        'left', 'right', or 'none'
+    """
+    left_bound  = frame_width // 3           # left lane boundary
+    right_bound = (frame_width * 2) // 3    # right lane boundary
+
+    green_x  = tokens['green']
+    red_x    = tokens['red']
+    yellow_x = tokens['yellow']
+
+    # Priority 1: Chase green token (+10% speed)
+    if green_x is not None:
+        if green_x < left_bound:
+            return 'left'
+        elif green_x > right_bound:
+            return 'right'
+        else:
+            return 'none'       # already lined up with green
+
+    # Priority 2: Avoid red token (-20% speed)
+    if red_x is not None:
+        if red_x < left_bound:
+            return 'right'      # red on left, go right
+        elif red_x > right_bound:
+            return 'left'       # red on right, go left
+        else:
+            return 'left'       # red in center, dodge left
+
+    # Priority 3: Dodge yellow token (unpredictable effect)
+    if yellow_x is not None:
+        if yellow_x < left_bound:
+            return 'right'
+        elif yellow_x > right_bound:
+            return 'left'
+        else:
+            return 'right'      # yellow in center, dodge right
+
+    return 'none'               # no token, go straight
+
+
 def processing_task():
-    #This is where you write your image processing code to decide how to control the car
-    #You can use libraries like OpenCV to process the image
-    #There is no limtation to the complexity of the processing task, you can use any libraries you want
-    #Remember to use the shared_data to get the latest frame
+    """
+    PERCEIVE + COMPUTE stage.
+    Calls detect_tokens() [Person 1] then decide_steering() [Person 2]
+    and writes the result into shared_data for send_controls_task to act on.
+    """
     with data_lock:
         front_frame = shared_data['latest_front_frame']
-    
-    if front_frame is not None:
-        # write your processing here
-        pass
+
+    if front_frame is None:
+        return
+
+    # [PERSON 1] Detect token positions from front camera
+    tokens, frame_width = detect_tokens(front_frame)
+
+    # [PERSON 2] Decide steering direction based on token positions
+    decision = decide_steering(tokens, frame_width)
+
+    # Debug: print when tokens are detected
+    if any(v is not None for v in tokens.values()):
+        print(f"[DETECT] green={tokens['green']} red={tokens['red']} yellow={tokens['yellow']} => {decision}")
+
+    with data_lock:
+        # Only write new decision if not already mid-tap
+        if shared_data['decision'] == 'none':
+            shared_data['decision'] = decision
+
+
 
 def send_controls_task():
     #This is where you send the control commands to the car using the control_conn
