@@ -397,21 +397,47 @@ def processing_task():
 
 
 
+# ---------------------------------------------------------
+# Steering Tap State (Person 3 — Steering Control)
+# A "tap" = apply full steering for a fixed number of control cycles, then
+# release. send_controls_task runs at period=0.005s, so:
+#   STEER_TAP_DURATION (25) x 0.005s = 0.125s of steering per lane change.
+# ---------------------------------------------------------
+STEER_TAP_DURATION = 25   # cycles per tap (tune for clean single-lane moves)
+steer_tap_counter = 0     # cycles remaining in the current tap (0 = idle)
+current_steer = 0.0       # steering value held during the current tap
+
+
 def send_controls_task():
-    #This is where you send the control commands to the car using the control_conn
-    global control_conn
+    """Actuate stage (Person 3): turn shared_data['decision'] into brief
+    steering pulses (taps) so the car changes lane without over-steering."""
+    global control_conn, steer_tap_counter, current_steer
     if control_conn is None:
         return
-    
-    #these are the variables used to control the car
-    #steering_input: -1.0 to 1.0 (left to right)
-    #acceleration_input: -1.0 to 1.0 (reverse to forward)
-    #this example always accelerate forward
-    steering_input = 0.0
-    acceleration_input = 1.0
+
+    acceleration_input = 1.0  # Phase 1: always forward
+
+    # --- Tap state machine ---
+    if steer_tap_counter > 0:
+        # Tap in progress: hold the current steer and count it down.
+        steer_tap_counter -= 1
+    else:
+        # Idle: consume the latest decision and start a fresh tap if needed.
+        with data_lock:
+            decision = shared_data['decision']
+            shared_data['decision'] = 'none'   # one tap per decision
+        if decision == 'left':
+            current_steer = -1.0
+            steer_tap_counter = STEER_TAP_DURATION
+        elif decision == 'right':
+            current_steer = 1.0
+            steer_tap_counter = STEER_TAP_DURATION
+        else:
+            current_steer = 0.0   # no decision -> drive straight
+
+    steering_input = current_steer
 
     try:
-        # Pack and send the control command
         data = struct.pack('ff', steering_input, acceleration_input)
         control_conn.sendall(data)
     except Exception as e:
