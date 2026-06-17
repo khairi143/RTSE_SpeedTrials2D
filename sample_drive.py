@@ -18,14 +18,6 @@ CONTROL_HOST = '127.0.0.1'
 CONTROL_PORT = 8081
 
 # Shared Resources with Mutex Lock for Concurrency
-shared_data = {
-    'latest_front_frame': None,
-    'latest_back_frame': None,
-    'steering_input' : 0.0,
-    'acceleration_input' : 0.0
-}
-data_lock = threading.Lock()
-is_running = True
 
 shared_data = {
     'latest_front_frame': None,
@@ -34,7 +26,8 @@ shared_data = {
     'acceleration_input': 0.0,
     'decision': 'none',     # NEW — 'left', 'right', or 'none'
 }
-
+data_lock = threading.Lock()
+is_running = True
 
 # ---------------------------------------------------------
 # Real-Time Scheduling Framework (Do not change this in your code)
