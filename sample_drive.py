@@ -25,6 +25,7 @@ shared_data = {
     'steering_input': 0.0,
     'acceleration_input': 0.0,
     'decision': 'none',     # NEW — 'left', 'right', or 'none'
+    'chasing_car':    False,    # [PERSON 3 V2.5] True when chasing car detected behind
 }
 data_lock = threading.Lock()
 is_running = True
@@ -389,6 +390,39 @@ def processing_task():
             shared_data['decision'] = decision
 
 
+# =========================================================
+# [PERSON 3 V2.5 - Chasing Car Detection (back camera)]
+# =========================================================
+CHASE_AREA_THRESHOLD = 2000   # px^2 — chasing car is "close" when blob this large
+
+def detect_chasing_car(frame):
+    """[PERSON 3 V2.5] Detect a car closing in from behind via the back camera.
+    Lower-half centre ROI -> grayscale -> blur -> Canny -> largest contour area."""
+    h, w = frame.shape[:2]
+    roi = frame[h // 2:, w * 30 // 100: w * 70 // 100]
+    gray  = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    blur  = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blur, 50, 150)
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return False
+    max_area = max(cv2.contourArea(c) for c in contours)
+    if max_area > CHASE_AREA_THRESHOLD:
+        print(f"[CHASE] Chasing car detected! area={max_area:.0f}")
+        return True
+    return False
+
+def rear_processing_task():
+    """[PERSON 3 V2.5] Separate RTTask: read back camera, run chasing detection,
+    write the 'chasing_car' flag. Kept separate so it never blocks front processing."""
+    with data_lock:
+        back_frame = shared_data['latest_back_frame']
+    if back_frame is None:
+        return
+    chasing = detect_chasing_car(back_frame)
+    with data_lock:
+        shared_data['chasing_car'] = chasing
+
 
 # ---------------------------------------------------------
 # Steering Tap State (Person 3 — Steering Control)
@@ -409,6 +443,13 @@ def send_controls_task():
         return
 
     acceleration_input = 1.0  # Phase 1: always forward
+
+    # [PERSON 3 V2.5] Chasing car escape: hold max acceleration to pull away
+    with data_lock:
+        is_chasing = shared_data['chasing_car']
+    if is_chasing:
+        acceleration_input = 1.0   # already max; logged explicitly
+        print("[CHASE] Chasing car close --- holding max acceleration!")
 
     # --- Tap state machine ---
     if steer_tap_counter > 0:
@@ -457,12 +498,14 @@ if __name__ == '__main__':
     t_front_camera = RTTask("ReadFrontCamera", period=0.005, priority=TaskPriority.HIGH, execute_func=read_front_camera_task)
     t_back_camera = RTTask("ReadBackCamera", period=0.005, priority=TaskPriority.HIGH, execute_func=read_back_camera_task)
     t_processing = RTTask("Processing", period=0.005, priority=TaskPriority.MEDIUM, execute_func=processing_task)
+    t_rear_processing = RTTask("RearProcessing", period=0.005, priority=TaskPriority.MEDIUM, execute_func=rear_processing_task)  # [PERSON 3 V2.5]
     t_controls = RTTask("SendControls", period=0.005, priority=TaskPriority.HIGH, execute_func=send_controls_task)
-    
+
     # Start tasks to run concurrently
     t_front_camera.start()
     t_back_camera.start()
     t_processing.start()
+    t_rear_processing.start()   # [PERSON 3 V2.5]
     t_controls.start()
     
     try:
@@ -477,6 +520,7 @@ if __name__ == '__main__':
     t_front_camera.join()
     t_back_camera.join()
     t_processing.join()
+    t_rear_processing.join()   # [PERSON 3 V2.5]
     t_controls.join()
     
     # This is to close all the connections
