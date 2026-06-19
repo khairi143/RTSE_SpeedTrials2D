@@ -202,7 +202,31 @@ def read_back_camera_task():
     read_single_camera(back_camera_sock, "Back Camera", 'latest_back_frame')
 
 # =========================================================
-# [SHAHIR - Token Detection]
+# [Shahir - Low Light Detection] v2
+# Checks mean brightness of the front frame.
+# If mean < 60 (out of 255), the scene is considered dark (Low Light event).
+# Sets shared_data['low_brightness'] = True - so can trigger recovery.
+# =========================================================
+def preprocess_frame(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    mean_val = float(np.mean(gray))
+    is_dark = mean_val < 60
+    with data_lock:
+        shared_data['low_brightness'] = is_dark
+    if is_dark:
+        with data_lock:
+            already_dark = shared_data.get('_prev_dark', False)
+        if not already_dark:
+            print(f"[DARK] Low light detected (mean brightness={mean_val:.1f})")
+        with data_lock:
+            shared_data['_prev_dark'] = True
+    else:
+        with data_lock:
+            shared_data['_prev_dark'] = False
+    return frame
+
+# =========================================================
+# [Shahir - Token Detection] v1
 # HSV color ranges calibrated for SpeedTrials2D tokens.
 # Green  : H=40-75  (lime green)
 # Red    : H=0-15 and H=165-180 (wraps around HSV wheel)
