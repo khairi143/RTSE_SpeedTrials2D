@@ -442,13 +442,28 @@ def send_controls_task():
     if control_conn is None:
         return
 
-    acceleration_input = 1.0  # Phase 1: always forward
+    with data_lock:
+        is_dark = shared_data['low_brightness']
+    if is_dark:
+        if not _dark_signal_sent:
+            print("[DARK] Recovery signal sent (accel=-1.0)")
+            _dark_signal_sent = True
+        try:
+            data = struct.pack('ff', 0.0, -1.0)  # reverse while dark
+            control_conn.sendall(data)
+        except Exception as e:
+            print(f"Control send error: {e}")
+            control_conn = None
+        return  # skip token-based steering while dark
+    else:
+        _dark_signal_sent = False  # reset for next dark event
 
-    # [PERSON 3 V2.5] Chasing car escape: hold max acceleration to pull away
+    # [PERSON 3 V2.5] Chasing car escape: floor the accelerator to pull away
     with data_lock:
         is_chasing = shared_data['chasing_car']
+    acceleration_input = 1.0  # normal: always forward
     if is_chasing:
-        acceleration_input = 1.0   # already max; logged explicitly
+        acceleration_input = 1.0  # already max, but logged explicitly
         print("[CHASE] Chasing car close --- holding max acceleration!")
 
     # --- Tap state machine ---
@@ -477,7 +492,6 @@ def send_controls_task():
     except Exception as e:
         print(f"Control send error: {e}")
         control_conn = None
-
 
 # ---------------------------------------------------------
 # Main (Scheduler Initialization)
