@@ -18,14 +18,23 @@ CONTROL_HOST = '127.0.0.1'
 CONTROL_PORT = 8081
 
 # Shared Resources with Mutex Lock for Concurrency
-
 shared_data = {
     'latest_front_frame': None,
     'latest_back_frame': None,
     'steering_input': 0.0,
     'acceleration_input': 0.0,
-    'decision': 'none',     # NEW — 'left', 'right', or 'none'
-    'chasing_car':    False,    # [PERSON 3 V2.5] True when chasing car detected behind
+    'decision': 'none',
+    'low_brightness': False,
+    'police_active':  False,
+    'chasing_car':    False,
+    # [PERSON 2 V2.5] Police car event state
+    'police_mode':         False,
+    'police_mode_expiry':  0.0,
+    # [PERSON 2 V3.0] EV5 Golden Lane event state
+    'ev5_active':          False,
+    'ev5_expiry':          0.0,
+    'ev5_target_x':        None,
+    'ev5_zone_hits':       [0, 0, 0],   # cumulative [left, centre, right] green-token hits this event
 }
 data_lock = threading.Lock()
 is_running = True
@@ -39,12 +48,6 @@ class TaskPriority:
     LOW = 3
 
 class RTTask(threading.Thread):
-    """
-    Real-Time Task implementing:
-    - Concurrency (inherits threading.Thread)
-    - Task Period (enforced in run loop)
-    - Task Priority (logical priority assigned)
-    """
     def __init__(self, name, period, priority, execute_func):
         super().__init__()
         self.name = name
@@ -63,15 +66,13 @@ class RTTask(threading.Thread):
                 ctypes.windll.kernel32.SetThreadPriority(handle, 0)
             elif self.priority == TaskPriority.LOW:
                 ctypes.windll.kernel32.SetThreadPriority(handle, -2)
-        except Exception as e:
+        except Exception:
             pass
-
         while is_running:
             start_time = time.time()
             self.execute_func()
             exec_time = time.time() - start_time
             sleep_time = self.period - exec_time
-            
             if sleep_time > 0:
                 time.sleep(sleep_time)
 
@@ -84,11 +85,9 @@ control_conn = None
 
 def setup_cameras():
     global front_camera_sock, back_camera_sock
-    
     print("Connecting to Cameras...")
     front_connected = False
     back_connected = False
-    
     while is_running and not (front_connected and back_connected):
         if not front_connected:
             try:
@@ -100,7 +99,6 @@ def setup_cameras():
                 front_connected = True
             except Exception:
                 pass
-                
         if not back_connected:
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -111,7 +109,6 @@ def setup_cameras():
                 back_connected = True
             except Exception:
                 pass
-                
         if not (front_connected and back_connected):
             time.sleep(1)
 
@@ -123,7 +120,6 @@ def setup_control_server():
     server_sock.listen()
     server_sock.settimeout(1.0)
     print(f"Control server listening on {CONTROL_HOST}:{CONTROL_PORT}")
-    
     while is_running:
         try:
             conn, addr = server_sock.accept()
@@ -134,21 +130,17 @@ def setup_control_server():
             continue
 
 # ---------------------------------------------------------
-# Task Implementations (This is where you write your tasks)
+# Task Implementations
 # ---------------------------------------------------------
-
 def read_single_camera(sock, window_name, data_key):
-    #This function reads the latest frame from the camera socket and stores it in the shared data
     if sock is None:
         return
-        
     try:
         latest_frame_data = None
         sock.settimeout(None)
         length_bytes = sock.recv(4)
         if not length_bytes:
             return
-            
         image_length = int.from_bytes(length_bytes, 'little')
         received_bytes = b''
         while len(received_bytes) < image_length and is_running:
@@ -156,15 +148,12 @@ def read_single_camera(sock, window_name, data_key):
             if not packet:
                 break
             received_bytes += packet
-            
         if len(received_bytes) == image_length:
             latest_frame_data = received_bytes
-            
         while is_running:
             readable, _, _ = select.select([sock], [], [], 0.0)
             if not readable:
                 break
-                
             sock.settimeout(1.0)
             length_bytes = sock.recv(4)
             if not length_bytes:
@@ -176,23 +165,18 @@ def read_single_camera(sock, window_name, data_key):
                 if not packet:
                     break
                 received_bytes += packet
-                
             if len(received_bytes) == image_length:
                 latest_frame_data = received_bytes
-                
         if latest_frame_data is not None:
             np_arr = np.frombuffer(latest_frame_data, np.uint8)
             frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
             if frame is not None:
                 with data_lock:
                     shared_data[data_key] = frame
-                
-                # You may disable this if you don't need to display the frames / This could effect the fps
                 frame_resized = cv2.resize(frame, (640, 480))
                 cv2.imshow(window_name, frame_resized)
                 cv2.waitKey(1)
-                
-    except Exception as e:
+    except Exception:
         pass
 
 def read_front_camera_task():
@@ -201,11 +185,11 @@ def read_front_camera_task():
 def read_back_camera_task():
     read_single_camera(back_camera_sock, "Back Camera", 'latest_back_frame')
 
+
 # =========================================================
-# [Shahir - Low Light Detection] v2
-# Checks mean brightness of the front frame.
-# If mean < 60 (out of 255), the scene is considered dark (Low Light event).
-# Sets shared_data['low_brightness'] = True - so can trigger recovery.
+# [PERSON 1 V2.5 - Low Light Detection]
+# Checks mean brightness. If mean < 60, scene is dark.
+# Sets shared_data['low_brightness'] = True for Person 4 recovery.
 # =========================================================
 def preprocess_frame(frame):
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -225,205 +209,81 @@ def preprocess_frame(frame):
             shared_data['_prev_dark'] = False
     return frame
 
+
 # =========================================================
-# [Shahir - Token Detection] v1
-# HSV color ranges calibrated for SpeedTrials2D tokens.
-# Green  : H=40-75  (lime green)
-# Red    : H=0-15 and H=165-180 (wraps around HSV wheel)
-# Yellow : H=16-35  (orange-yellow)
+# [PERSON 2 V2.5 - Police Car Detection]
+# The police car is a blue/purple vehicle (H=100-135, S>100, V>40).
+# Contour-based detection in road area only (top 35% sky excluded)
+# avoids false positives from the night sky (same hue as police car).
 # =========================================================
-GREEN_LOWER  = np.array([40,  40, 100])
-GREEN_UPPER  = np.array([75, 255, 255])
+POLICE_CAR_LOWER    = np.array([100, 100,  40])
+POLICE_CAR_UPPER    = np.array([135, 255, 255])
+POLICE_CAR_MIN_AREA = 150
+POLICE_EVENT_DURATION = 5.0
 
-RED_LOWER1   = np.array([0,  100, 100])
-RED_UPPER1   = np.array([15, 255, 255])
-RED_LOWER2   = np.array([165, 100, 100])
-RED_UPPER2   = np.array([180, 255, 255])
-
-YELLOW_LOWER = np.array([16, 100, 150])
-YELLOW_UPPER = np.array([35, 255, 255])
-
-
-def detect_tokens(frame):
-    """
-    [PERSON 1 - Token Detection]
-    Scans the front camera frame for colored tokens using HSV color detection.
-    Only looks at the bottom 3/4 of the frame (top 1/4 is sky, no tokens there).
-
-    Returns:
-        tokens (dict): {'green': x_pos or None, 'red': x_pos or None, 'yellow': x_pos or None}
-                        x_pos is the center-x pixel of the largest detected blob.
-        frame_width (int): width of the frame in pixels.
-    """
+def detect_police_car(frame):
+    """Returns (True, car_x) if blue/purple police car found, else (False, None)."""
     h, w = frame.shape[:2]
-    roi = frame[h // 4 : h * 7 // 10, :]  # ignore sky (top 25%) and own car + near ground (bottom 30%)
+    road = frame[h * 35 // 100 : h * 85 // 100, :]
+    hsv  = cv2.cvtColor(road, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, POLICE_CAR_LOWER, POLICE_CAR_UPPER)
+    mask = cv2.dilate(mask, None, iterations=2)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return False, None
+    largest = max(contours, key=cv2.contourArea)
+    if cv2.contourArea(largest) < POLICE_CAR_MIN_AREA:
+        return False, None
+    M = cv2.moments(largest)
+    if M['m00'] == 0:
+        return False, None
+    car_x = int(M['m10'] / M['m00'])
+    print(f"[POLICE] Car detected at x={car_x}")
+    return True, car_x
+
+
+# =========================================================
+# [PERSON 2 V2.5 - Police Red Token Detection]
+# Police event red tokens are 4000+px² — too large for detect_tokens()
+# which caps at 3000px². This function has no upper size limit.
+# detect_tokens() is NOT modified.
+# =========================================================
+POLICE_RED_MIN_AREA = 300
+
+def detect_police_red_token(frame):
+    """Returns centre-X of largest red blob (no upper size limit), or None."""
+    h, w = frame.shape[:2]
+    roi = frame[h // 4 : h * 7 // 10, :]
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-
-    def largest_blob_x(mask):
-        """Find the center-x of the largest token-shaped blob in the mask."""
-        mask = cv2.dilate(mask, None, iterations=2)
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            return None
-
-        token_candidates = []
-        for c in contours:
-            area = cv2.contourArea(c)
-            if not (150 < area < 1000):
-                continue                        # wrong size
-            x, y, cw, ch = cv2.boundingRect(c)
-            if ch == 0:
-                continue
-            aspect = cw / ch
-            if not (0.4 < aspect < 2.5):
-                continue                        # too elongated (road stripe)
-            fill = area / (cw * ch)
-            if fill < 0.45:
-                continue                        # hollow/diagonal shape (road stripe)
-            cx = x + cw // 2
-            if cx < w * 0.25 or cx > w * 0.75:
-                continue                        # too close to screen edge
-            token_candidates.append((area, cx))
-
-        if not token_candidates:
-            return None
-        # Return x of the largest passing candidate
-        return max(token_candidates, key=lambda t: t[0])[1]
-
-    # Detect each token color
-    green_x  = largest_blob_x(cv2.inRange(hsv, GREEN_LOWER, GREEN_UPPER))
-
-    red_mask = cv2.bitwise_or(                              # red wraps around HSV
+    red_mask = cv2.bitwise_or(
         cv2.inRange(hsv, RED_LOWER1, RED_UPPER1),
         cv2.inRange(hsv, RED_LOWER2, RED_UPPER2)
     )
-    red_x    = largest_blob_x(red_mask)
-
-    yellow_x = largest_blob_x(cv2.inRange(hsv, YELLOW_LOWER, YELLOW_UPPER))
-
-    # Draw detected blobs on the frame for visual debug
-    roi_top = h // 4
-    debug_frame = frame.copy()
-    for color_name, mask, bgr in [
-        ('G', cv2.inRange(hsv, GREEN_LOWER, GREEN_UPPER), (0, 255, 0)),
-        ('R', red_mask, (0, 0, 255)),
-        ('Y', cv2.inRange(hsv, YELLOW_LOWER, YELLOW_UPPER), (0, 255, 255)),
-    ]:
-        mask = cv2.dilate(mask, None, iterations=2)
-        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for c in cnts:
-            area = cv2.contourArea(c)
-            if not (150 < area < 1000):
-                continue
-            x, y, cw, ch = cv2.boundingRect(c)
-            if ch == 0: continue
-            aspect = cw / ch
-            fill = area / (cw * ch)
-            cx = x + cw // 2
-            if 0.4 < aspect < 2.5 and fill > 0.45 and w * 0.25 < cx < w * 0.75:
-                cv2.rectangle(debug_frame, (x, y + roi_top), (x + cw, y + ch + roi_top), bgr, 2)
-                cv2.putText(debug_frame, f'{color_name}:{area:.0f}',
-                            (x, y + roi_top - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, bgr, 1)
-    cv2.imshow('Token Debug', cv2.resize(debug_frame, (640, 480)))
-    cv2.waitKey(1)
-
-    return {'green': green_x, 'red': red_x, 'yellow': yellow_x}, w
-
-# =========================================================
-# [PERSON 2 - Token Decision]
-# Takes token positions and decides steering direction.
-# Priority order: Green (collect) > Red (avoid) > Yellow (dodge)
-# Frame is divided into 3 zones: left / center / right
-# =========================================================
-def decide_steering(tokens, frame_width):
-    """
-    [PERSON 2 - Token Decision]
-    Decides which direction to steer based on detected token positions.
-
-    Logic:
-        - Green token detected → steer toward it to collect (+10% speed)
-        - Red token detected   → steer away from it to avoid (-20% speed)
-        - Yellow token detected → dodge it (random chaos effect)
-        - No token detected    → go straight
-
-    Returns:
-        'left', 'right', or 'none'
-    """
-    left_bound  = frame_width // 3           # left lane boundary
-    right_bound = (frame_width * 2) // 3    # right lane boundary
-
-    green_x  = tokens['green']
-    red_x    = tokens['red']
-    yellow_x = tokens['yellow']
-
-    # Priority 1: Chase green token (+10% speed)
-    if green_x is not None:
-        if green_x < left_bound:
-            return 'left'
-        elif green_x > right_bound:
-            return 'right'
-        else:
-            return 'none'       # already lined up with green
-
-    # Priority 2: Avoid red token (-20% speed)
-    if red_x is not None:
-        if red_x < left_bound:
-            return 'right'      # red on left, go right
-        elif red_x > right_bound:
-            return 'left'       # red on right, go left
-        else:
-            return 'left'       # red in center, dodge left
-
-    # Priority 3: Dodge yellow token (unpredictable effect)
-    if yellow_x is not None:
-        if yellow_x < left_bound:
-            return 'right'
-        elif yellow_x > right_bound:
-            return 'left'
-        else:
-            return 'right'      # yellow in center, dodge right
-
-    return 'none'               # no token, go straight
-
-
-def processing_task():
-    """
-    PERCEIVE + COMPUTE stage.
-    Calls detect_tokens() [Person 1] then decide_steering() [Person 2]
-    and writes the result into shared_data for send_controls_task to act on.
-    """
-    with data_lock:
-        front_frame = shared_data['latest_front_frame']
-
-    if front_frame is None:
-        return
-
-    # [PERSON 1] Detect token positions from front camera
-    tokens, frame_width = detect_tokens(front_frame)
-
-    # [PERSON 2] Decide steering direction based on token positions
-    decision = decide_steering(tokens, frame_width)
-
-    # Debug: print when tokens are detected
-    if any(v is not None for v in tokens.values()):
-        print(f"[DETECT] green={tokens['green']} red={tokens['red']} yellow={tokens['yellow']} => {decision}")
-
-    with data_lock:
-        # Only write new decision if not already mid-tap
-        if shared_data['decision'] == 'none':
-            shared_data['decision'] = decision
+    red_mask = cv2.dilate(red_mask, None, iterations=2)
+    contours, _ = cv2.findContours(red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    valid = [(cv2.contourArea(c), c) for c in contours if cv2.contourArea(c) > POLICE_RED_MIN_AREA]
+    if not valid:
+        return None
+    largest_c = max(valid, key=lambda t: t[0])[1]
+    M = cv2.moments(largest_c)
+    if M['m00'] == 0:
+        return None
+    return int(M['m10'] / M['m00'])
 
 
 # =========================================================
-# [PERSON 3 V2.5 - Chasing Car Detection (back camera)]
+# [PERSON 3 V2.5 - Chasing Car Detection]
+# Uses back camera. Canny edge detect in lower-centre ROI.
+# If largest contour > CHASE_AREA_THRESHOLD, a car is close.
 # =========================================================
-CHASE_AREA_THRESHOLD = 2000   # px^2 — chasing car is "close" when blob this large
+CHASE_AREA_THRESHOLD = 2000
 
 def detect_chasing_car(frame):
-    """[PERSON 3 V2.5] Detect a car closing in from behind via the back camera.
-    Lower-half centre ROI -> grayscale -> blur -> Canny -> largest contour area."""
+    """Returns True if chasing car detected close behind."""
     h, w = frame.shape[:2]
-    roi = frame[h // 2:, w * 30 // 100: w * 70 // 100]
+    roi = frame[h // 2:, w * 30 // 100 : w * 70 // 100]
     gray  = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
     blur  = cv2.GaussianBlur(gray, (5, 5), 0)
     edges = cv2.Canny(blur, 50, 150)
@@ -437,8 +297,7 @@ def detect_chasing_car(frame):
     return False
 
 def rear_processing_task():
-    """[PERSON 3 V2.5] Separate RTTask: read back camera, run chasing detection,
-    write the 'chasing_car' flag. Kept separate so it never blocks front processing."""
+    """[PERSON 3 V2.5] Runs chasing car detection on back camera."""
     with data_lock:
         back_frame = shared_data['latest_back_frame']
     if back_frame is None:
@@ -448,21 +307,356 @@ def rear_processing_task():
         shared_data['chasing_car'] = chasing
 
 
-# ---------------------------------------------------------
-# Steering Tap State (Person 3 — Steering Control)
-# A "tap" = apply full steering for a fixed number of control cycles, then
-# release. send_controls_task runs at period=0.005s, so:
-#   STEER_TAP_DURATION (25) x 0.005s = 0.125s of steering per lane change.
-# ---------------------------------------------------------
-STEER_TAP_DURATION = 25   # cycles per tap (tune for clean single-lane moves)
-steer_tap_counter = 0     # cycles remaining in the current tap (0 = idle)
-current_steer = 0.0       # steering value held during the current tap
+# =========================================================
+# [SHAHIR V1.0 - Token Detection]
+# HSV color ranges calibrated for SpeedTrials2D tokens.
+# Green  : H=40-75  | Red: H=0-15 and H=165-180 | Yellow: H=16-35
+# =========================================================
+GREEN_LOWER  = np.array([40,  40, 100])
+GREEN_UPPER  = np.array([75, 255, 255])
+RED_LOWER1   = np.array([0,  100, 100])
+RED_UPPER1   = np.array([15, 255, 255])
+RED_LOWER2   = np.array([165, 100, 100])
+RED_UPPER2   = np.array([180, 255, 255])
+YELLOW_LOWER = np.array([16, 100, 150])
+YELLOW_UPPER = np.array([35, 255, 255])
+BLUE_LOWER   = np.array([100,  80, 120])
+BLUE_UPPER   = np.array([130, 255, 255])
+
+
+def detect_tokens(frame):
+    """
+    [PERSON 1 V1.0 - Token Detection] — DO NOT MODIFY
+    Scans front camera for colored tokens using HSV color detection.
+    Returns: tokens dict {'green', 'red', 'yellow'} -> centre-x or None, and frame_width.
+    """
+    h, w = frame.shape[:2]
+    roi = frame[h // 4 : h * 7 // 10, :]
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+
+    def largest_blob_x(mask):
+        mask = cv2.dilate(mask, None, iterations=2)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None
+        token_candidates = []
+        for c in contours:
+            area = cv2.contourArea(c)
+            if not (400 < area < 3000):
+                continue
+            x, y, cw, ch = cv2.boundingRect(c)
+            if ch == 0:
+                continue
+            aspect = cw / ch
+            if not (0.4 < aspect < 2.5):
+                continue
+            fill = area / (cw * ch)
+            if fill < 0.45:
+                continue
+            cx = x + cw // 2
+            if cx < w * 0.35 or cx > w * 0.65:
+                continue
+            token_candidates.append((area, cx))
+        if not token_candidates:
+            return None
+        return max(token_candidates, key=lambda t: t[0])[1]
+
+    green_x  = largest_blob_x(cv2.inRange(hsv, GREEN_LOWER, GREEN_UPPER))
+    red_mask = cv2.bitwise_or(
+        cv2.inRange(hsv, RED_LOWER1, RED_UPPER1),
+        cv2.inRange(hsv, RED_LOWER2, RED_UPPER2)
+    )
+    red_x    = largest_blob_x(red_mask)
+    yellow_x = largest_blob_x(cv2.inRange(hsv, YELLOW_LOWER, YELLOW_UPPER))
+
+    roi_top = h // 4
+    debug_frame = frame.copy()
+    for color_name, mask, bgr in [
+        ('G', cv2.inRange(hsv, GREEN_LOWER, GREEN_UPPER), (0, 255, 0)),
+        ('R', red_mask, (0, 0, 255)),
+        ('Y', cv2.inRange(hsv, YELLOW_LOWER, YELLOW_UPPER), (0, 255, 255)),
+    ]:
+        mask = cv2.dilate(mask, None, iterations=2)
+        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for c in cnts:
+            area = cv2.contourArea(c)
+            if not (400 < area < 3000):
+                continue
+            x, y, cw, ch = cv2.boundingRect(c)
+            if ch == 0:
+                continue
+            aspect = cw / ch
+            fill = area / (cw * ch)
+            cx = x + cw // 2
+            if 0.4 < aspect < 2.5 and fill > 0.45 and w * 0.35 < cx < w * 0.65:
+                cv2.rectangle(debug_frame, (x, y + roi_top), (x + cw, y + ch + roi_top), bgr, 2)
+                cv2.putText(debug_frame, f'{color_name}:{area:.0f}',
+                            (x, y + roi_top - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, bgr, 1)
+    cv2.imshow('Token Debug', cv2.resize(debug_frame, (640, 480)))
+    cv2.waitKey(1)
+    return {'green': green_x, 'red': red_x, 'yellow': yellow_x}, w
+
+
+# =========================================================
+# [PERSON 2 V1.0 - Token Decision] — DO NOT MODIFY
+# Priority: Green (collect) > Red (avoid) > Yellow (dodge)
+# =========================================================
+def decide_steering(tokens, frame_width):
+    """Returns 'left', 'right', or 'none' based on token positions."""
+    left_bound  = frame_width // 3
+    right_bound = (frame_width * 2) // 3
+    green_x  = tokens['green']
+    red_x    = tokens['red']
+    yellow_x = tokens['yellow']
+
+    if green_x is not None:
+        if green_x < left_bound:
+            return 'left'
+        elif green_x > right_bound:
+            return 'right'
+        else:
+            if red_x is not None:
+                if red_x < left_bound:    return 'right'
+                elif red_x > right_bound: return 'left'
+                else:                     return 'right'
+            if yellow_x is not None:
+                if yellow_x < left_bound:    return 'right'
+                elif yellow_x > right_bound: return 'left'
+                else:                        return 'right'
+            return 'none'
+
+    if red_x is not None:
+        if red_x < left_bound:    return 'right'
+        elif red_x > right_bound: return 'left'
+        else:                     return 'left'
+
+    if yellow_x is not None:
+        if yellow_x < left_bound:    return 'right'
+        elif yellow_x > right_bound: return 'left'
+        else:                        return 'right'
+
+    return 'none'
+
+
+# =========================================================
+# [PERSON 2 V3.0 - EV5 Golden Lane Detection]
+# The Golden Lane event fires a full-screen green flash (~0.4s).
+# During the flash everything is green — detect_tokens() (max 3000px²)
+# ignores the massive background blob (140,000px²). After the flash,
+# only tokens in the golden lane stay green.
+#
+# IMPORTANT: green is also a normal/recurring token colour during regular
+# gameplay (confirmed via frame analysis of a real run), so a single
+# isolated green blob can appear in ANY lane by chance — picking "the
+# single largest green blob" is not reliable on its own, since two
+# unrelated green tokens can be on screen in different lanes at once.
+# The golden lane instead reveals itself as repeated/stacked green tokens
+# scrolling down the SAME lane over time. detect_golden_lane_zone_hits()
+# tallies close, confidently-resolved green detections per lane (left/
+# centre/right) each frame; processing_task() accumulates this over the
+# whole 5s window and the lane with consistently "many green along it"
+# wins, instead of reacting to any single frame's biggest blob.
+# detect_tokens() also misses lane-1/3 tokens (edge filter cx<0.35w),
+# so this detector uses no edge restriction.
+# =========================================================
+EV5_FLASH_THRESHOLD = 0.40
+EV5_EVENT_DURATION  = 5.0
+EV5_TOKEN_MAX_AREA   = 50000
+EV5_CLOSE_MIN_AREA   = 1200   # ignore small/far blobs whose lane isn't resolved yet
+EV5_CLOSE_Y_FRAC     = 0.55   # must sit in the lower (closer-to-camera) part of the ROI
+EV5_LANE_MARGIN      = 2      # a lane must lead the runner-up by this many hits to commit
+
+
+def detect_ev5_flash(frame):
+    """
+    [PERSON 2 V3.0 - EV5 Flash Detection]
+    Returns True when >40% of the frame is bright green (the golden lane flash).
+    Normal gameplay has only 5-20% green; the flash spikes to >90%.
+    """
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    green_mask = cv2.inRange(hsv, np.array([35, 80, 80]), np.array([85, 255, 255]))
+    total_pixels = frame.shape[0] * frame.shape[1]
+    green_pct = green_mask.sum() / 255 / total_pixels
+    return green_pct > EV5_FLASH_THRESHOLD
+
+
+def detect_golden_lane_zone_hits(frame):
+    """
+    [PERSON 2 V3.0 - Golden Lane Zone Tally]
+    Counts close, confidently-resolved green tokens per lane third
+    (left / centre / right) in this single frame. Far-away/small blobs
+    are skipped because perspective hasn't resolved their true lane yet.
+    Returns [left_hits, centre_hits, right_hits] for this frame only —
+    the caller accumulates these across the 5s event window.
+    """
+    h, w = frame.shape[:2]
+    roi = frame[h // 4 : h * 7 // 10, :]
+    roi_h = roi.shape[0]
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    green_mask = cv2.inRange(hsv, np.array([35, 80, 80]), np.array([85, 255, 255]))
+    green_mask = cv2.dilate(green_mask, None, iterations=2)
+    contours, _ = cv2.findContours(green_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    left_bound, right_bound = w // 3, (w * 2) // 3
+    hits = [0, 0, 0]
+    for c in contours:
+        area = cv2.contourArea(c)
+        if not (EV5_CLOSE_MIN_AREA < area < EV5_TOKEN_MAX_AREA):
+            continue
+        M = cv2.moments(c)
+        if M['m00'] == 0:
+            continue
+        cx = M['m10'] / M['m00']
+        cy = M['m01'] / M['m00']
+        if cy < roi_h * EV5_CLOSE_Y_FRAC:
+            continue
+        if cx < left_bound:
+            hits[0] += 1
+        elif cx > right_bound:
+            hits[2] += 1
+        else:
+            hits[1] += 1
+    return hits
+
+
+def processing_task():
+    """
+    PERCEIVE + COMPUTE stage.
+    Event priority (highest first):
+      1. Police car event  [PERSON 2 V2.5] — collect red token, avoid police car
+      2. EV5 golden lane   [PERSON 2 V3.0] — steer to golden lane within 5s
+      3. Normal steering   [PERSON 2 V2.5] — chase green, avoid red/yellow
+    detect_tokens() and low-light handling are NOT modified.
+    """
+    with data_lock:
+        front_frame = shared_data['latest_front_frame']
+    if front_frame is None:
+        return
+
+    preprocess_frame(front_frame)
+    tokens, frame_width = detect_tokens(front_frame)
+    now = time.time()
+
+    # ── Police Car Event ───────────────────────────────────────────────────────
+    with data_lock:
+        pm_active = shared_data['police_mode']
+        pm_expiry = shared_data['police_mode_expiry']
+
+    police_visible, police_x = detect_police_car(front_frame)
+
+    if police_visible and not pm_active:
+        with data_lock:
+            shared_data['police_mode']        = True
+            shared_data['police_mode_expiry'] = now + POLICE_EVENT_DURATION
+            shared_data['police_active']      = True
+        pm_active = True
+        print(f"[POLICE] Event started — collect red token within {POLICE_EVENT_DURATION:.0f}s!")
+
+    if pm_active and now > pm_expiry:
+        with data_lock:
+            shared_data['police_mode']   = False
+            shared_data['police_active'] = False
+        pm_active = False
+        print("[POLICE] Event window closed")
+
+    if pm_active:
+        red_x = detect_police_red_token(front_frame)
+        left_bound  = frame_width // 3
+        right_bound = (frame_width * 2) // 3
+        if red_x is not None:
+            if red_x < left_bound:    decision = 'left'
+            elif red_x > right_bound: decision = 'right'
+            else:                     decision = 'none'
+            if police_x is not None:
+                if decision == 'left'  and police_x < left_bound:  decision = 'right'
+                elif decision == 'right' and police_x > right_bound: decision = 'left'
+            print(f"[POLICE] red_x={red_x} police_x={police_x} => {decision}")
+        else:
+            if police_x is not None:
+                if police_x < left_bound:    decision = 'right'
+                elif police_x > right_bound: decision = 'left'
+                else:                        decision = 'left'
+            else:
+                decision = 'none'
+        with data_lock:
+            if shared_data['decision'] == 'none':
+                shared_data['decision'] = decision
+        return
+
+    # ── EV5 Golden Lane Event ──────────────────────────────────────────────────
+    with data_lock:
+        ev5_active = shared_data['ev5_active']
+        ev5_expiry = shared_data['ev5_expiry']
+
+    flash_active = detect_ev5_flash(front_frame)
+
+    if flash_active and not ev5_active:
+        with data_lock:
+            shared_data['ev5_active']    = True
+            shared_data['ev5_expiry']    = now + EV5_EVENT_DURATION
+            shared_data['ev5_target_x']  = None
+            shared_data['ev5_zone_hits'] = [0, 0, 0]
+        ev5_active = True
+        print(f"[EV5] Golden Lane flash — steering to golden lane for {EV5_EVENT_DURATION:.0f}s!")
+
+    if ev5_active and now > ev5_expiry:
+        with data_lock:
+            shared_data['ev5_active']    = False
+            shared_data['ev5_target_x']  = None
+            shared_data['ev5_zone_hits'] = [0, 0, 0]
+        ev5_active = False
+        print("[EV5] Golden Lane window expired")
+
+    if ev5_active:
+        if flash_active:
+            print("[EV5] Flash active — holding course")
+            return
+        hits = detect_golden_lane_zone_hits(front_frame)
+        with data_lock:
+            cum = shared_data['ev5_zone_hits']
+            cum = [cum[i] + hits[i] for i in range(3)]
+            shared_data['ev5_zone_hits'] = cum
+        best_i     = max(range(3), key=lambda i: cum[i])
+        runner_up  = max(v for i, v in enumerate(cum) if i != best_i)
+        if cum[best_i] > 0 and cum[best_i] >= runner_up + EV5_LANE_MARGIN:
+            decision = ['left', 'none', 'right'][best_i]
+        else:
+            decision = 'none'
+        print(f"[EV5] zone_hits(L,C,R)={cum} => {decision}")
+        with data_lock:
+            if shared_data['decision'] == 'none':
+                shared_data['decision'] = decision
+        return
+
+    # ── Normal token steering ──────────────────────────────────────────────────
+    with data_lock:
+        shared_data['police_active'] = False
+
+    decision = decide_steering(tokens, frame_width)
+    if any(v is not None for v in tokens.values()):
+        print(f"[DETECT] green={tokens['green']} red={tokens['red']} yellow={tokens['yellow']} => {decision}")
+    with data_lock:
+        if shared_data['decision'] == 'none':
+            shared_data['decision'] = decision
+
+
+# =========================================================
+# [PERSON 3 V2.5 - Steering Tap State]
+# STEER_TAP_DURATION x period = 25 x 0.005s = 0.125s pulse per lane change.
+# =========================================================
+STEER_TAP_DURATION = 25
+steer_tap_counter  = 0
+current_steer      = 0.0
+_dark_signal_sent  = False
 
 
 def send_controls_task():
-    """Actuate stage (Person 3): turn shared_data['decision'] into brief
-    steering pulses (taps) so the car changes lane without over-steering."""
-    global control_conn, steer_tap_counter, current_steer
+    """
+    ACTUATE stage.
+    [PERSON 4 V2.5] Low-light: reverse (accel=-1.0) until bright again.
+    [PERSON 3 V2.5] Chasing car: hold max acceleration to escape.
+    [PERSON 3 V2.5] Tap state machine: brief steering pulses for lane changes.
+    """
+    global control_conn, steer_tap_counter, current_steer, _dark_signal_sent
     if control_conn is None:
         return
 
@@ -473,46 +667,37 @@ def send_controls_task():
             print("[DARK] Recovery signal sent (accel=-1.0)")
             _dark_signal_sent = True
         try:
-            data = struct.pack('ff', 0.0, -1.0)  # reverse while dark
-            control_conn.sendall(data)
+            control_conn.sendall(struct.pack('ff', 0.0, -1.0))
         except Exception as e:
             print(f"Control send error: {e}")
             control_conn = None
-        return  # skip token-based steering while dark
+        return
     else:
-        _dark_signal_sent = False  # reset for next dark event
+        _dark_signal_sent = False
 
-    # [PERSON 3 V2.5] Chasing car escape: floor the accelerator to pull away
     with data_lock:
         is_chasing = shared_data['chasing_car']
-    acceleration_input = 1.0  # normal: always forward
+    acceleration_input = 1.0
     if is_chasing:
-        acceleration_input = 1.0  # already max, but logged explicitly
         print("[CHASE] Chasing car close --- holding max acceleration!")
 
-    # --- Tap state machine ---
     if steer_tap_counter > 0:
-        # Tap in progress: hold the current steer and count it down.
         steer_tap_counter -= 1
     else:
-        # Idle: consume the latest decision and start a fresh tap if needed.
         with data_lock:
             decision = shared_data['decision']
-            shared_data['decision'] = 'none'   # one tap per decision
+            shared_data['decision'] = 'none'
         if decision == 'left':
-            current_steer = -1.0
+            current_steer     = -1.0
             steer_tap_counter = STEER_TAP_DURATION
         elif decision == 'right':
-            current_steer = 1.0
+            current_steer     = 1.0
             steer_tap_counter = STEER_TAP_DURATION
         else:
-            current_steer = 0.0   # no decision -> drive straight
-
-    steering_input = current_steer
+            current_steer = 0.0
 
     try:
-        data = struct.pack('ff', steering_input, acceleration_input)
-        control_conn.sendall(data)
+        control_conn.sendall(struct.pack('ff', current_steer, acceleration_input))
     except Exception as e:
         print(f"Control send error: {e}")
         control_conn = None
@@ -522,51 +707,37 @@ def send_controls_task():
 # ---------------------------------------------------------
 if __name__ == '__main__':
     print("Initializing RTSE Sample Drive...")
-    
-    # Initialize network connections
     threading.Thread(target=setup_control_server, daemon=True).start()
     threading.Thread(target=setup_cameras, daemon=True).start()
-    
-    print("\n--- Starting Real-Time Tasks (awaiting connections dynamically) ---\n")
-    
-    # This is where you define tasks with explicit Scheduling parameters (Concurrency, Priority, Period)
-    # Period refers to the period of execution of the task in seconds
-    # Priority refers to the priority of the task, higher priority means higher priority
-    # Concurrency refers to the number of instances of the task that can run at the same time
-    t_front_camera = RTTask("ReadFrontCamera", period=0.005, priority=TaskPriority.HIGH, execute_func=read_front_camera_task)
-    t_back_camera = RTTask("ReadBackCamera", period=0.005, priority=TaskPriority.HIGH, execute_func=read_back_camera_task)
-    t_processing = RTTask("Processing", period=0.005, priority=TaskPriority.MEDIUM, execute_func=processing_task)
-    t_rear_processing = RTTask("RearProcessing", period=0.005, priority=TaskPriority.MEDIUM, execute_func=rear_processing_task)  # [PERSON 3 V2.5]
-    t_controls = RTTask("SendControls", period=0.005, priority=TaskPriority.HIGH, execute_func=send_controls_task)
+    print("\n--- Starting Real-Time Tasks ---\n")
 
-    # Start tasks to run concurrently
+    t_front_camera = RTTask("ReadFrontCamera", period=0.005, priority=TaskPriority.HIGH,   execute_func=read_front_camera_task)
+    t_back_camera  = RTTask("ReadBackCamera",  period=0.005, priority=TaskPriority.HIGH,   execute_func=read_back_camera_task)
+    t_processing   = RTTask("Processing",      period=0.005, priority=TaskPriority.MEDIUM, execute_func=processing_task)
+    t_rear_proc    = RTTask("RearProcessing",  period=0.005, priority=TaskPriority.MEDIUM, execute_func=rear_processing_task)
+    t_controls     = RTTask("SendControls",    period=0.005, priority=TaskPriority.HIGH,   execute_func=send_controls_task)
+
     t_front_camera.start()
     t_back_camera.start()
     t_processing.start()
-    t_rear_processing.start()   # [PERSON 3 V2.5]
+    t_rear_proc.start()
     t_controls.start()
-    
+
     try:
-        # You need this to keep the main thread alive, otherwise the program will exit immediately
         while is_running:
             time.sleep(1)
     except KeyboardInterrupt:
         print("\nKeyboard Interrupt detected. Stopping system...")
         is_running = False
 
-    # This is to make sure that the tasks are terminated cleanly
     t_front_camera.join()
     t_back_camera.join()
     t_processing.join()
-    t_rear_processing.join()   # [PERSON 3 V2.5]
+    t_rear_proc.join()
     t_controls.join()
-    
-    # This is to close all the connections
-    if front_camera_sock:
-        front_camera_sock.close()
-    if back_camera_sock:
-        back_camera_sock.close()
-    if control_conn:
-        control_conn.close()
+
+    if front_camera_sock: front_camera_sock.close()
+    if back_camera_sock:  back_camera_sock.close()
+    if control_conn:      control_conn.close()
     cv2.destroyAllWindows()
     print("System terminated cleanly.")
