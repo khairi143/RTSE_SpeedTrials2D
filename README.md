@@ -42,7 +42,6 @@ Each task is an instance of the `RTTask` class (a `threading.Thread` subclass) t
 **V3.0 — Game-day events**
 - EV5 Golden Lane event — detect the full-screen green flash, then tally close, high-confidence green token detections per lane over the 5-second event window (rather than trusting a single largest blob per frame, which is unreliable since green is also a normal token colour during regular play)
 
-Every function and section in `sample_drive.py` is comment-tagged `[PERSON N VX.X - Feature Name]` so contributions and versions are traceable at a glance.
 
 ## Project structure
 
