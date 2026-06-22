@@ -702,7 +702,6 @@ def send_controls_task():
         print(f"Control send error: {e}")
         control_conn = None
 
-
 # ---------------------------------------------------------
 # Main (Scheduler Initialization)
 # ---------------------------------------------------------
