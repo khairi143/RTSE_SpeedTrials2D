@@ -43,3 +43,27 @@ def save_scores(rows, path=CSV_PATH):
         writer.writerow(["run", "score"])
         for run, score in rows:
             writer.writerow([run, score])
+
+
+def main(path=CSV_PATH):
+    rows = load_scores(path)
+    print(format_table(rows))
+    run = next_run_number(rows)
+    while True:
+        user_input = input(f"Enter score for run {run} (or q to quit): ").strip()
+        if user_input.lower() in ("q", "quit"):
+            print(f"Saved {len(rows)} run(s) to {path}")
+            break
+        try:
+            score = parse_score(user_input)
+        except ValueError:
+            print("Invalid score - please enter a number.")
+            continue
+        rows.append((run, score))
+        save_scores(rows, path)
+        print(format_table(rows))
+        run += 1
+
+
+if __name__ == "__main__":
+    main()

@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from score_tracker import (
     parse_score,
@@ -65,6 +66,35 @@ class TestLoadSaveScores(unittest.TestCase):
         with open(self.path, "w") as f:
             f.write("not,a,valid,csv\nheader\n1,2,3,4\n")
         self.assertEqual(load_scores(self.path), [])
+
+
+class TestMainLoop(unittest.TestCase):
+    def setUp(self):
+        fd, self.path = tempfile.mkstemp(suffix=".csv")
+        os.close(fd)
+        os.remove(self.path)
+
+    def tearDown(self):
+        if os.path.exists(self.path):
+            os.remove(self.path)
+
+    def test_full_session_saves_scores_and_quits(self):
+        from score_tracker import main
+
+        inputs = iter(["10", "7.5", "q"])
+        with patch("builtins.input", lambda _: next(inputs)):
+            main(self.path)
+
+        self.assertEqual(load_scores(self.path), [(1, 10.0), (2, 7.5)])
+
+    def test_invalid_input_does_not_advance_run_number(self):
+        from score_tracker import main
+
+        inputs = iter(["abc", "5", "q"])
+        with patch("builtins.input", lambda _: next(inputs)):
+            main(self.path)
+
+        self.assertEqual(load_scores(self.path), [(1, 5.0)])
 
 
 if __name__ == "__main__":
